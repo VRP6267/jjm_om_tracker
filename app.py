@@ -428,8 +428,8 @@ def show_login_page():
     - Change default password after first login
     
     **Technical Support:**
-    - Email: support@jjm.gov.in
-    - Phone: 1800-XXX-XXXX
+    - Email: v.r.p@outlook.com
+    - Phone: 9555087808
     """)
 
 def show_admin_panel():
