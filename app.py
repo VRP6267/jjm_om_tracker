@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-District JJM O&M Tracker
-VERSION 1.4.2 - FINAL, STABLE VERSION
+VERSION 1.4.3 - FINAL, STABLE VERSION
 Features:
 1. Role-based multi-user authentication with flexible Agency+Multi-Block filtering for Engineers
 2. Admin panel with scheme count preview for Engineer assignments
@@ -16,6 +16,7 @@ Features:
 11. Corporate users can now view and manage data across all districts.
 12. Reverted import logic to be position-based for reliability, fixing the import error.
 13. Added function for admins to delete all imported data for a specific district.
+14. Added function for admins to delete a user.
 """
 
 import streamlit as st
@@ -404,6 +405,16 @@ def check_user_has_agency_assignment(user_data):
     if user_data.get('role') == 'Engineer' and not user_data.get('assigned_agency'):
         return False
     return True
+
+def delete_user(user_id):
+    """Permanently deletes a user from the district_users table."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM district_users WHERE user_id = ?", (user_id,))
+            conn.commit()
+        return True, "User successfully deleted."
+    except sqlite3.Error as e:
+        return False, f"Database error: {e}"
 
 # --- Data Functions ---
 
@@ -1742,8 +1753,8 @@ def show_admin_panel():
         with col2:
             with st.expander("✏️ Edit User / Reset Password"):
                 if not all_users.empty:
+                    user_list = all_users.set_index('user_id')[['username', 'full_name', 'role']].apply(lambda x: f"{x['username']} ({x['full_name']}) - {x['role']}", axis=1).to_dict()
                     with st.form("edit_user_form"):
-                        user_list = all_users.set_index('user_id')[['username', 'full_name', 'role']].apply(lambda x: f"{x['username']} ({x['full_name']}) - {x['role']}", axis=1).to_dict()
                         selected_user_id = st.selectbox("Select User to Edit", options=list(user_list.keys()), format_func=lambda x: user_list[x])
                         
                         current_user = all_users[all_users['user_id'] == selected_user_id].iloc[0]
@@ -1792,6 +1803,35 @@ def show_admin_panel():
                                 st.rerun()
                 else:
                     st.info("No users have been created yet.")
+            
+            with st.expander("❌ Delete User"):
+                if not all_users.empty:
+                    user_list_delete = all_users.set_index('user_id')[['username', 'full_name', 'role']].apply(lambda x: f"{x['username']} ({x['full_name']}) - {x['role']}", axis=1).to_dict()
+                    user_to_delete_id = st.selectbox(
+                        "Select User to PERMANENTLY delete",
+                        options=list(user_list_delete.keys()),
+                        format_func=lambda x: user_list_delete[x],
+                        index=None,
+                        placeholder="Choose user...",
+                        key="delete_user_selectbox"
+                    )
+
+                    if user_to_delete_id:
+                        user_to_delete_username = user_list_delete[user_to_delete_id].split(' ')[0]
+                        st.warning(f"**DANGER:** This action is irreversible. You are about to permanently delete the user **{user_to_delete_username}**.", icon="⚠️")
+                        
+                        confirm_delete_user = st.checkbox("I confirm I want to permanently delete this user.", key="confirm_delete_user_checkbox")
+
+                        if st.button("DELETE USER", disabled=not confirm_delete_user, type="primary"):
+                            success, message = delete_user(user_to_delete_id)
+                            if success:
+                                st.success(message)
+                                st.rerun()
+                            else:
+                                st.error(message)
+                else:
+                    st.info("No users to delete.")
+
 
     with tab3:
         st.subheader("📊 System Statistics")
@@ -1922,7 +1962,7 @@ def show_district_app():
             """)
     
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Version 1.4.2**")
+    st.sidebar.markdown("**Version 1.4.3**")
     st.sidebar.markdown("**Published by V R Patruni**")
     
     page_functions = {
