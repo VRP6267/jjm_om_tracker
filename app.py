@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-District JJM O&M Tracker
-VERSION 1.4.1 - FINAL, STABLE VERSION
+VERSION 1.4.2 - FINAL, STABLE VERSION
 Features:
 1. Role-based multi-user authentication with flexible Agency+Multi-Block filtering for Engineers
 2. Admin panel with scheme count preview for Engineer assignments
@@ -15,6 +15,7 @@ Features:
 10. Data cleaning on import to remove leading/trailing spaces
 11. Corporate users can now view and manage data across all districts.
 12. Reverted import logic to be position-based for reliability, fixing the import error.
+13. Added function for admins to delete all imported data for a specific district.
 """
 
 import streamlit as st
@@ -606,6 +607,25 @@ def create_whatsapp_summary_message(scheme_name, issues_df):
         
     message += "\nPlease review the dashboard for full details."
     return message
+
+def delete_imported_data_for_district(district_id):
+    """
+    Deletes all transactional data (schemes, progress, issues) for a specific district.
+    This does NOT delete the district itself or its users.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            # Delete associated data from transactional tables
+            cursor.execute("DELETE FROM issues WHERE district_id = ?", (district_id,))
+            cursor.execute("DELETE FROM progress WHERE district_id = ?", (district_id,))
+            cursor.execute("DELETE FROM schemes WHERE district_id = ?", (district_id,))
+            conn.commit()
+        return True, "Successfully deleted all schemes, progress, and issue data for the selected district."
+    except sqlite3.Error as e:
+        conn.rollback()
+        return False, f"Database error: {e}"
 
 # --- UI Functions ---
 
@@ -1579,6 +1599,40 @@ def show_admin_panel():
         if not districts_df.empty:
             st.dataframe(districts_df.drop('district_id', axis=1), use_container_width=True)
 
+        st.markdown("---")
+        with st.expander("🗑️ Clear Imported Data for a District"):
+            st.warning("⚠️ **Action Required:** This will permanently delete all schemes, progress entries, and issues associated with the selected district. User accounts and the district entry itself will NOT be deleted. This is useful for clearing out old data before a fresh import.", icon="🗑️")
+
+            if not districts_df.empty:
+                # Create a map for easy ID lookup
+                district_map_delete = pd.Series(districts_df.district_id.values, index=districts_df.district_name).to_dict()
+
+                district_to_clear_name = st.selectbox(
+                    "Select a district to clear:",
+                    options=districts_df['district_name'].tolist(),
+                    index=None,
+                    placeholder="Choose a district...",
+                    key="district_clear_selectbox"
+                )
+
+                if district_to_clear_name:
+                    # Add a confirmation checkbox for safety
+                    confirm_clear = st.checkbox(f"I understand that I am about to delete all scheme data for **{district_to_clear_name}**.", key="confirm_clear_checkbox")
+
+                    if st.button(f"Clear Data for {district_to_clear_name}", disabled=not confirm_clear, type="primary"):
+                        district_to_clear_id = district_map_delete[district_to_clear_name]
+
+                        # Call the new deletion function
+                        success, message = delete_imported_data_for_district(district_to_clear_id)
+
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+            else:
+                st.info("No districts available.")
+
     with tab2:
         st.subheader("👥 User Management")
         with sqlite3.connect(DB_PATH) as conn:
@@ -1868,7 +1922,7 @@ def show_district_app():
             """)
     
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Version 1.4.1**")
+    st.sidebar.markdown("**Version 1.4.2**")
     st.sidebar.markdown("**Published by V R Patruni**")
     
     page_functions = {
