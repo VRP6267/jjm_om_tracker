@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-District JJM O&M Tracker
-VERSION 1.3.3 - FINAL, STABLE VERSION
+VERSION 1.4.1 - FINAL, STABLE VERSION
 Features:
 1. Role-based multi-user authentication with flexible Agency+Multi-Block filtering for Engineers
 2. Admin panel with scheme count preview for Engineer assignments
@@ -13,6 +13,8 @@ Features:
 8. Case-insensitive block assignment in admin panel
 9. Corrected state management in the "Add User" form
 10. Data cleaning on import to remove leading/trailing spaces
+11. Corporate users can now view and manage data across all districts.
+12. Reverted import logic to be position-based for reliability, fixing the import error.
 """
 
 import streamlit as st
@@ -419,53 +421,41 @@ def get_delay_settings():
         return defaults
 
 def get_scheme_data_with_issues(user_data):
-    """Get scheme data with progress and issue impact, filtered by user role, agency, and multiple blocks."""
+    """
+    Get scheme data with progress and issue impact.
+    - Engineers/Managers are filtered by their assigned district/blocks/agency.
+    - Corporate users can see all data across all districts.
+    """
     delay_penalties = get_delay_settings()
     
-    query = "SELECT * FROM schemes"
+    query = "SELECT s.*, d.district_name FROM schemes s JOIN districts d ON s.district_id = d.district_id"
     params = []
     
     role = user_data.get('role')
-    district_id = user_data.get('district_id')
-    assigned_block = user_data.get('assigned_block')
-    assigned_agency = user_data.get('assigned_agency')
     
-    # Build filtering conditions based on role
     conditions = []
     
-    if role == 'Engineer':
-        # Engineers see only their assigned district, blocks, and agency
-        conditions.append("district_id = ?")
+    if role == 'Corporate':
+        pass 
+        
+    elif role in ['Engineer', 'Manager / Coordinator']:
+        district_id = user_data.get('district_id')
+        assigned_block = user_data.get('assigned_block')
+        assigned_agency = user_data.get('assigned_agency')
+        
+        conditions.append("s.district_id = ?")
         params.append(district_id)
         
-        # Handle multiple blocks assignment
         if assigned_block and assigned_block.upper() != "ALL":
             blocks = parse_assigned_blocks(assigned_block)
             if blocks:
                 placeholders = ','.join('?' * len(blocks))
-                conditions.append(f"UPPER(block) IN ({placeholders})")
+                conditions.append(f"UPPER(s.block) IN ({placeholders})")
                 params.extend(blocks)
         
-        # Handle agency assignment for Engineers
-        if assigned_agency and assigned_agency.upper() != "ALL":
-            conditions.append("UPPER(agency) = ?")
+        if role == 'Engineer' and assigned_agency and assigned_agency.upper() != "ALL":
+            conditions.append("UPPER(s.agency) = ?")
             params.append(assigned_agency.upper())
-            
-    elif role == 'Manager / Coordinator':
-        # Managers see all agencies in their assigned district/blocks
-        conditions.append("district_id = ?")
-        params.append(district_id)
-        
-        if assigned_block and assigned_block.upper() != "ALL":
-            blocks = parse_assigned_blocks(assigned_block)
-            if blocks:
-                placeholders = ','.join('?' * len(blocks))
-                conditions.append(f"UPPER(block) IN ({placeholders})")
-                params.extend(blocks)
-    
-    elif role == 'Corporate':
-        # Corporate users see everything
-        pass
     
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -481,21 +471,21 @@ def get_scheme_data_with_issues(user_data):
         
         placeholders = ','.join('?' * len(districts_to_query))
         
-        progress_query = f"SELECT p.scheme_id, AVG(CASE c.entry_type WHEN 'metric' THEN (CAST(p.achieved_value AS REAL) / NULLIF(p.target_value, 0)) * 100 ELSE p.progress_percent END) as avg_progress, MAX(p.days_remaining) as max_days_remaining FROM progress p JOIN components c ON p.component_id = c.component_id WHERE p.district_id IN ({placeholders}) GROUP BY p.scheme_id"
-        issues_query = f"SELECT scheme_id, COUNT(*) as total_issues, COUNT(CASE WHEN is_resolved = 0 THEN 1 END) as open_issues, COUNT(CASE WHEN severity = 'Critical' AND is_resolved = 0 THEN 1 END) as critical_issues, COUNT(CASE WHEN severity = 'High' AND is_resolved = 0 THEN 1 END) as high_issues, COUNT(CASE WHEN issue_category = 'Material not delivered' AND is_resolved = 0 THEN 1 END) as material_issues, COUNT(CASE WHEN issue_category = 'Payment issues' AND is_resolved = 0 THEN 1 END) as payment_issues, COUNT(CASE WHEN issue_category = 'Contractor not working' AND is_resolved = 0 THEN 1 END) as contractor_issues FROM issues WHERE district_id IN ({placeholders}) GROUP BY scheme_id"
+        progress_query = f"SELECT p.scheme_id, p.district_id, AVG(CASE c.entry_type WHEN 'metric' THEN (CAST(p.achieved_value AS REAL) / NULLIF(p.target_value, 0)) * 100 ELSE p.progress_percent END) as avg_progress, MAX(p.days_remaining) as max_days_remaining FROM progress p JOIN components c ON p.component_id = c.component_id WHERE p.district_id IN ({placeholders}) GROUP BY p.scheme_id, p.district_id"
+        issues_query = f"SELECT scheme_id, district_id, COUNT(*) as total_issues, COUNT(CASE WHEN is_resolved = 0 THEN 1 END) as open_issues, COUNT(CASE WHEN severity = 'Critical' AND is_resolved = 0 THEN 1 END) as critical_issues, COUNT(CASE WHEN severity = 'High' AND is_resolved = 0 THEN 1 END) as high_issues, COUNT(CASE WHEN issue_category = 'Material not delivered' AND is_resolved = 0 THEN 1 END) as material_issues, COUNT(CASE WHEN issue_category = 'Payment issues' AND is_resolved = 0 THEN 1 END) as payment_issues, COUNT(CASE WHEN issue_category = 'Contractor not working' AND is_resolved = 0 THEN 1 END) as contractor_issues FROM issues WHERE district_id IN ({placeholders}) GROUP BY scheme_id, district_id"
         
         progress_df = pd.read_sql_query(progress_query, conn, params=districts_to_query)
         issues_df = pd.read_sql_query(issues_query, conn, params=districts_to_query)
         
         if not progress_df.empty:
-            full_df = pd.merge(schemes_df, progress_df, on="scheme_id", how="left")
+            full_df = pd.merge(schemes_df, progress_df, on=["scheme_id", "district_id"], how="left")
         else:
             full_df = schemes_df
             full_df['avg_progress'] = 0
             full_df['max_days_remaining'] = 0
         
         if not issues_df.empty:
-            full_df = pd.merge(full_df, issues_df, on="scheme_id", how="left")
+            full_df = pd.merge(full_df, issues_df, on=["scheme_id", "district_id"], how="left")
         
         issue_cols = ['total_issues', 'open_issues', 'critical_issues', 'high_issues', 'material_issues', 'payment_issues', 'contractor_issues']
         for col in issue_cols:
@@ -557,7 +547,7 @@ def create_problem_report_excel(problem_schemes_df):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        summary_cols = ['scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'critical_issues', 'risk_level']
+        summary_cols = ['district_name', 'scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'critical_issues', 'risk_level']
         problem_schemes_df[summary_cols].to_excel(writer, sheet_name='Problem Schemes Summary', index=False)
 
         problem_scheme_ids = tuple(problem_schemes_df['scheme_id'].unique())
@@ -583,9 +573,9 @@ def create_issues_report_excel(issues_df):
     df_to_export = issues_df.copy()
     
     export_cols = {
-        'scheme_name': 'Scheme', 'block': 'Block', 'component_name': 'Component', 'issue_category': 'Category',
-        'issue_description': 'Description', 'severity': 'Severity', 'reported_by': 'Reported By',
-        'reported_date': 'Reported Date', 'expected_resolution_date': 'Expected Resolution'
+        'district_name': 'District', 'scheme_name': 'Scheme', 'block': 'Block', 'component_name': 'Component', 
+        'issue_category': 'Category', 'issue_description': 'Description', 'severity': 'Severity', 
+        'reported_by': 'Reported By', 'reported_date': 'Reported Date', 'expected_resolution_date': 'Expected Resolution'
     }
     df_to_export = df_to_export[[col for col in export_cols if col in df_to_export.columns]].rename(columns=export_cols)
     
@@ -688,7 +678,7 @@ def show_whatsapp_sender(message_content, district_id, key_prefix=""):
         )
 
     if contacts_df.empty:
-        st.warning("No WhatsApp contacts found. Please ask your manager to add contacts in the 'WhatsApp Contacts' page.")
+        st.warning("No WhatsApp contacts found for this district. Please ask your manager to add contacts.")
         return
 
     contact_options = {f"{row['contact_name']} ({row['contact_role']})": row['phone_number'] for _, row in contacts_df.iterrows()}
@@ -736,29 +726,28 @@ Report: {subject}
             st.warning("Could not generate the report file.")
 
 def show_dashboard(user_data):
-    """Main dashboard, filtered by user role with enhanced assignment display."""
-    st.title(f"🏠 {user_data['district_name']} - Dashboard")
+    """Main dashboard, now with full multi-district view for Corporate users."""
+    role = user_data.get('role')
     
-    # Show detailed assignment info for Engineers
-    if user_data.get('role') == 'Engineer':
+    if role == 'Corporate':
+        st.title("🏢 Corporate Dashboard")
+    else:
+        st.title(f"🏠 {user_data['district_name']} - Dashboard")
+
+    if role == 'Engineer':
         assigned_blocks = parse_assigned_blocks(user_data.get('assigned_block'))
         assigned_agency = user_data.get('assigned_agency', 'N/A')
-        
-        if assigned_blocks:
-            block_display = ', '.join(assigned_blocks)
-        else:
-            block_display = user_data.get('assigned_block', 'N/A')
-        
-        # Get scheme count for Engineer's assignment
-        scheme_count = get_scheme_count_for_assignment(
-            user_data['district_id'], 
-            assigned_agency, 
-            assigned_blocks
-        )
-        
+        block_display = ', '.join(assigned_blocks) if assigned_blocks else user_data.get('assigned_block', 'N/A')
+        scheme_count = get_scheme_count_for_assignment(user_data['district_id'], assigned_agency, assigned_blocks)
         st.info(f"**Your Assignment:** {assigned_agency} | {block_display} | **{scheme_count} schemes**")
     
     df = get_scheme_data_with_issues(user_data)
+    
+    if role == 'Corporate' and not df.empty:
+        districts = ["All Districts"] + sorted(df['district_name'].unique().tolist())
+        selected_district = st.selectbox("Filter by District", districts)
+        if selected_district != "All Districts":
+            df = df[df['district_name'] == selected_district].copy()
     
     if not df.empty:
         status_counts = df['status'].value_counts()
@@ -776,38 +765,65 @@ def show_dashboard(user_data):
         col3.metric("🟢 Low Risk", risk_counts.get('Low Risk', 0))
         
         st.subheader("📊 Schemes Overview")
-        display_df = df[['scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'risk_level', 'status']].copy()
-        display_df.columns = ['Scheme Name', 'Block', 'Agency', 'Progress %', 'Open Issues', 'Risk Level', 'Status']
+        if role == 'Corporate':
+            display_cols = ['district_name', 'scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'risk_level', 'status']
+            col_names = ['District', 'Scheme Name', 'Block', 'Agency', 'Progress %', 'Open Issues', 'Risk Level', 'Status']
+        else:
+            display_cols = ['scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'risk_level', 'status']
+            col_names = ['Scheme Name', 'Block', 'Agency', 'Progress %', 'Open Issues', 'Risk Level', 'Status']
+        
+        display_df = df[display_cols].copy()
+        display_df.columns = col_names
         
         st.dataframe(display_df, use_container_width=True)
     else:
         st.info("No schemes found for your assigned scope. Please contact your administrator.")
 
 def show_progress_entry(user_data):
-    """Enhanced progress entry with issue reporting and multi-block support"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
+    """Progress entry, now with district selection for Corporate users."""
     reporter_name = user_data['full_name']
     role = user_data.get('role')
+
+    district_id = None
+    district_name = None
+
+    if role == 'Corporate':
+        st.title("🏢 Corporate - Progress Entry")
+        with sqlite3.connect(DB_PATH) as conn:
+            districts_df = pd.read_sql_query("SELECT district_id, district_name FROM districts ORDER BY district_name", conn)
+        
+        if districts_df.empty:
+            st.warning("No districts found. Please add districts in the Admin Panel.")
+            return
+            
+        district_map = pd.Series(districts_df.district_id.values, index=districts_df.district_name).to_dict()
+        selected_district_name = st.selectbox("Select District to Enter Progress for:", list(district_map.keys()))
+        
+        if selected_district_name:
+            district_id = district_map[selected_district_name]
+            district_name = selected_district_name
+    else:
+        district_id = user_data['district_id']
+        district_name = user_data['district_name']
+        st.title(f"✏️ {district_name} - Progress Entry")
+
+    if not district_id:
+        st.info("Please select a district to proceed.")
+        return
+        
     assigned_block = user_data.get('assigned_block')
     assigned_agency = user_data.get('assigned_agency')
 
-    st.title(f"✏️ {district_name} - Progress Entry")
-    
-    # Build query with role-based filtering supporting multiple blocks
     with sqlite3.connect(DB_PATH) as conn:
         query = "SELECT scheme_id, scheme_name, block, agency, has_tw2 FROM schemes WHERE district_id = ?"
         params = [district_id]
         
         if role == 'Engineer':
-            # Handle multiple blocks assignment for Engineers
             if assigned_block and assigned_block.upper() != "ALL":
                 blocks = parse_assigned_blocks(assigned_block)
                 if blocks:
-                    placeholders = ','.join('?' * len(blocks))
-                    query += f" AND UPPER(block) IN ({placeholders})"
+                    query += f" AND UPPER(block) IN ({','.join('?'*len(blocks))})"
                     params.extend(blocks)
-            
             if assigned_agency and assigned_agency.upper() != "ALL":
                 query += " AND UPPER(agency) = ?"
                 params.append(assigned_agency.upper())
@@ -816,20 +832,13 @@ def show_progress_entry(user_data):
             if assigned_block and assigned_block.upper() != "ALL":
                 blocks = parse_assigned_blocks(assigned_block)
                 if blocks:
-                    placeholders = ','.join('?' * len(blocks))
-                    query += f" AND UPPER(block) IN ({placeholders})"
+                    query += f" AND UPPER(block) IN ({','.join('?'*len(blocks))})"
                     params.extend(blocks)
         
-        # Show detailed assignment info for Engineers
         if role == 'Engineer':
             assigned_blocks = parse_assigned_blocks(assigned_block)
             scheme_count = get_scheme_count_for_assignment(district_id, assigned_agency, assigned_blocks)
-            
-            if assigned_blocks:
-                block_display = ', '.join(assigned_blocks)
-            else:
-                block_display = assigned_block or 'N/A'
-                
+            block_display = ', '.join(assigned_blocks) if assigned_blocks else (assigned_block or 'N/A')
             st.info(f"**Your Assignment:** {assigned_agency or 'N/A'} | {block_display} | **{scheme_count} schemes**")
 
         schemes_df = pd.read_sql_query(query, conn, params=params)
@@ -843,7 +852,7 @@ def show_progress_entry(user_data):
             
             site_type = "main"
             if scheme_info['has_tw2']:
-                selected_site_name = st.radio("Choose site:", ["Main Site", "TW-2 Site"], horizontal=True)
+                selected_site_name = st.radio("Choose site:", ["Main Site", "TW-2 Site"], horizontal=True, key=f"site_{selected_scheme_id}")
                 site_type = "tw2" if selected_site_name == "TW-2 Site" else "main"
             
             st.subheader(f"📋 {scheme_info['scheme_name']} - {site_type.upper()} Site")
@@ -860,7 +869,7 @@ def show_progress_entry(user_data):
             
             for i, group_name in enumerate(component_groups):
                 with tabs[i]:
-                    with st.form(key=f"form_{group_name}_{site_type}"):
+                    with st.form(key=f"form_{group_name}_{site_type}_{district_id}"):
                         st.markdown(f"### {group_name}")
                         
                         updates = []
@@ -924,33 +933,42 @@ def show_progress_entry(user_data):
                             st.success(f"✅ {group_name} progress and any new issues have been saved!")
                             st.rerun()
     else:
-        st.info("No schemes found for your assigned scope. Please contact your administrator or import schemes for this scope.")
+        st.info(f"No schemes found for {district_name}. Please import schemes for this district.")
 
 def show_analytics(user_data):
-    """Analytics page for district with multi-block support"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
-    st.title(f"📈 {district_name} - Smart Analytics")
+    """Analytics page with multi-district filtering for Corporate users."""
+    role = user_data.get('role')
+    
+    if role == 'Corporate':
+        st.title("📈 Corporate - Smart Analytics")
+    else:
+        district_name = user_data['district_name']
+        st.title(f"📈 {district_name} - Smart Analytics")
     
     df = get_scheme_data_with_issues(user_data)
     if df.empty:
         st.warning("No data available to analyze. Please import schemes and enter progress.")
         return
     
-    col1, col2, col3 = st.columns([2, 2, 1])
-    blocks = ["All Blocks"] + sorted(df['block'].unique().tolist())
-    selected_block = col1.selectbox("Filter by Block", blocks)
+    filter_cols = st.columns(3)
     
+    if role == 'Corporate':
+        districts = ["All Districts"] + sorted(df['district_name'].unique().tolist())
+        selected_district = filter_cols[0].selectbox("Filter by District", districts)
+        if selected_district != "All Districts":
+            df = df[df['district_name'] == selected_district].copy()
+    
+    blocks = ["All Blocks"] + sorted(df['block'].unique().tolist())
+    selected_block = filter_cols[0 if role != 'Corporate' else 1].selectbox("Filter by Block", blocks)
     if selected_block != "All Blocks":
         df = df[df['block'] == selected_block].copy()
     
     agencies = ["All Agencies"] + sorted(df['agency'].unique().tolist())
-    selected_agency = col2.selectbox("Filter by Agency", agencies)
-    
+    selected_agency = filter_cols[1 if role != 'Corporate' else 2].selectbox("Filter by Agency", agencies)
     if selected_agency != "All Agencies":
         df = df[df['agency'] == selected_agency].copy()
     
-    buffer_days = col3.number_input("Verification Buffer (days)", 0, 60, 20, 1)
+    buffer_days = st.number_input("Verification Buffer (days)", 0, 60, 20, 1)
     
     tab1, tab2, tab3 = st.tabs(["Smart Forecast", "Issue Impact Analysis", "Charts & Visuals"])
     
@@ -985,10 +1003,13 @@ The delay for each issue is calculated based on its severity and category using 
             
             st.markdown("---")
             
-            display_cols = ['scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'risk_level', 'max_days_remaining', 'issue_delay_impact', 'adjusted_days_remaining', 'physical_completion_date', 'forecasted_om_date']
+            display_cols = ['district_name', 'scheme_name', 'block', 'agency', 'avg_progress', 'open_issues', 'risk_level', 'max_days_remaining', 'issue_delay_impact', 'adjusted_days_remaining', 'physical_completion_date', 'forecasted_om_date']
             forecast_display = forecast_df[display_cols].copy()
-            forecast_display.columns = ['Scheme Name', 'Block', 'Agency', 'Progress %', 'Open Issues', 'Risk Level', 'Original Days', 'Issue Delay', 'Adjusted Days', 'Est. Completion', 'Forecasted O&M Start']
+            forecast_display.columns = ['District', 'Scheme Name', 'Block', 'Agency', 'Progress %', 'Open Issues', 'Risk Level', 'Original Days', 'Issue Delay', 'Adjusted Days', 'Est. Completion', 'Forecasted O&M Start']
             
+            if role != 'Corporate':
+                forecast_display = forecast_display.drop(columns=['District'])
+
             forecast_display['Est. Completion'] = pd.to_datetime(forecast_display['Est. Completion']).dt.strftime('%d/%m/%Y')
             forecast_display['Forecasted O&M Start'] = pd.to_datetime(forecast_display['Forecasted O&M Start']).dt.strftime('%d/%m/%Y')
 
@@ -1032,13 +1053,13 @@ The delay for each issue is calculated based on its severity and category using 
         fig1, ax1 = plt.subplots(figsize=(10, 6))
         risk_status_crosstab = pd.crosstab(df['risk_level'], df['status'])
         risk_status_crosstab.plot(kind='bar', ax=ax1, stacked=True)
-        ax1.set_title(f"{district_name} - Risk Level vs Status")
+        ax1.set_title(f"Risk Level vs Status")
         ax1.set_ylabel("Number of Schemes")
         ax1.tick_params(axis='x', rotation=45)
         plt.tight_layout()
         st.pyplot(fig1)
         
-        if not forecast_df.empty:
+        if not forecast_df.empty and len(forecast_df) > 1:
             fig2, ax2 = plt.subplots(figsize=(12, 6))
             x_pos = range(len(forecast_df))
             ax2.bar([x - 0.2 for x in x_pos], forecast_df['max_days_remaining'], 0.4, label='Original Timeline', alpha=0.7)
@@ -1054,92 +1075,93 @@ The delay for each issue is calculated based on its severity and category using 
     
     st.markdown("---")
     st.subheader("📥 Download Enhanced Analytics Report")
-    excel_data = create_analytics_report(df, forecast_df[display_cols] if not forecast_df.empty else pd.DataFrame())
+    report_name = f"Multi-District_Smart_JJM_Analytics_{datetime.now(IST).strftime('%Y%m%d')}.xlsx" if role == 'Corporate' else f"{user_data['district_name']}_Smart_JJM_Analytics_{datetime.now(IST).strftime('%Y%m%d')}.xlsx"
+    excel_data = create_analytics_report(df, forecast_display if not forecast_df.empty else pd.DataFrame())
     st.download_button(
         label="📥 Download Smart Analytics Report (Excel)",
         data=excel_data,
-        file_name=f"{district_name}_Smart_JJM_Analytics_{datetime.now(IST).strftime('%Y%m%d')}.xlsx",
+        file_name=report_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 def show_issues_dashboard(user_data):
-    """Issues dashboard page for district with WhatsApp functionality for Engineers and multi-block support"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
+    """Issues dashboard with multi-district filtering for Corporate users."""
     role = user_data.get('role')
 
-    st.title(f"🚨 {district_name} - Issues Dashboard")
-    
-    # Build query with role-based filtering for issues supporting multiple blocks
-    with sqlite3.connect(DB_PATH) as conn:
-        base_query = '''
-            SELECT i.*, s.scheme_name, s.block, s.agency, c.component_name, c.component_group
-            FROM issues i
-            JOIN schemes s ON i.scheme_id = s.scheme_id AND i.district_id = s.district_id
-            JOIN components c ON i.component_id = c.component_id
-            WHERE i.district_id = ?
-        '''
-        params = [district_id]
+    if role == 'Corporate':
+        st.title("🚨 Corporate - Issues Dashboard")
+    else:
+        st.title(f"🚨 {user_data['district_name']} - Issues Dashboard")
         
-        # Apply role-based filtering for Engineers with multi-block support
+    base_query = '''
+        SELECT i.*, s.scheme_name, s.block, s.agency, d.district_name, c.component_name, c.component_group
+        FROM issues i
+        JOIN schemes s ON i.scheme_id = s.scheme_id AND i.district_id = s.district_id
+        JOIN districts d ON i.district_id = d.district_id
+        JOIN components c ON i.component_id = c.component_id
+    '''
+    params = []
+    conditions = []
+
+    if role == 'Corporate':
+        pass 
+    else:
+        conditions.append("i.district_id = ?")
+        params.append(user_data['district_id'])
+        
+        assigned_block = user_data.get('assigned_block')
+        assigned_agency = user_data.get('assigned_agency')
+
         if role == 'Engineer':
-            assigned_block = user_data.get('assigned_block')
-            assigned_agency = user_data.get('assigned_agency')
-            
             if assigned_block and assigned_block.upper() != "ALL":
                 blocks = parse_assigned_blocks(assigned_block)
                 if blocks:
-                    placeholders = ','.join('?' * len(blocks))
-                    base_query += f" AND UPPER(s.block) IN ({placeholders})"
+                    conditions.append(f"UPPER(s.block) IN ({','.join('?'*len(blocks))})")
                     params.extend(blocks)
-            
             if assigned_agency and assigned_agency.upper() != "ALL":
-                base_query += " AND UPPER(s.agency) = ?"
+                conditions.append("UPPER(s.agency) = ?")
                 params.append(assigned_agency.upper())
-        
         elif role == 'Manager / Coordinator':
-            assigned_block = user_data.get('assigned_block')
             if assigned_block and assigned_block.upper() != "ALL":
                 blocks = parse_assigned_blocks(assigned_block)
                 if blocks:
-                    placeholders = ','.join('?' * len(blocks))
-                    base_query += f" AND UPPER(s.block) IN ({placeholders})"
+                    conditions.append(f"UPPER(s.block) IN ({','.join('?'*len(blocks))})")
                     params.extend(blocks)
-        
-        base_query += " ORDER BY s.scheme_name, i.reported_date DESC"
+    
+    if conditions:
+        base_query += " WHERE " + " AND ".join(conditions)
+
+    base_query += " ORDER BY d.district_name, s.scheme_name, i.reported_date DESC"
+    
+    with sqlite3.connect(DB_PATH) as conn:
         issues_df = pd.read_sql_query(base_query, conn, params=params)
-    
+
     if issues_df.empty:
-        st.info("No issues reported yet for your assigned scope. Issues will appear here when reported through Progress Entry.")
+        st.info("No issues reported for your assigned scope.")
         return
-    
+        
     issues_df['reported_date'] = pd.to_datetime(issues_df['reported_date'], format='mixed', errors='coerce')
     issues_df['expected_resolution_date'] = pd.to_datetime(issues_df['expected_resolution_date'], errors='coerce')
-    
-    col1, col2, col3, col4 = st.columns(4)
-    total_issues = len(issues_df)
-    open_issues = len(issues_df[issues_df['is_resolved'] == 0])
-    critical_issues = len(issues_df[(issues_df['severity'] == 'Critical') & (issues_df['is_resolved'] == 0)])
-    resolved_issues = len(issues_df[issues_df['is_resolved'] == 1])
-    
-    col1.metric("Total Issues", total_issues)
-    col2.metric("Open Issues", open_issues, delta=f"-{resolved_issues} resolved")
-    col3.metric("Critical Open", critical_issues)
-    col4.metric("Resolved Issues", resolved_issues)
-    
+
     st.subheader("🔍 Filter Issues")
-    col1, col2, col3 = st.columns(3)
-    
-    status_options = ["All", "Open", "Resolved"]
-    selected_status = col1.selectbox("Status", status_options)
-    
-    severity_options = ["All"] + sorted(issues_df['severity'].unique().tolist())
-    selected_severity = col2.selectbox("Severity", severity_options)
-    
-    category_options = ["All"] + sorted(issues_df['issue_category'].unique().tolist())
-    selected_category = col3.selectbox("Issue Category", category_options)
+    filter_cols = st.columns(4 if role == 'Corporate' else 3)
     
     filtered_df = issues_df.copy()
+
+    if role == 'Corporate':
+        districts = ["All"] + sorted(issues_df['district_name'].unique().tolist())
+        selected_district = filter_cols[0].selectbox("District", districts)
+        if selected_district != "All":
+            filtered_df = filtered_df[filtered_df['district_name'] == selected_district]
+            
+    status_options = ["All", "Open", "Resolved"]
+    selected_status = filter_cols[1 if role == 'Corporate' else 0].selectbox("Status", status_options)
+
+    severity_options = ["All"] + sorted(issues_df['severity'].unique().tolist())
+    selected_severity = filter_cols[2 if role == 'Corporate' else 1].selectbox("Severity", severity_options)
+    
+    category_options = ["All"] + sorted(issues_df['issue_category'].unique().tolist())
+    selected_category = filter_cols[3 if role == 'Corporate' else 2].selectbox("Issue Category", category_options)
     
     if selected_status == "Open":
         filtered_df = filtered_df[filtered_df['is_resolved'] == 0]
@@ -1151,26 +1173,40 @@ def show_issues_dashboard(user_data):
     
     if selected_category != "All":
         filtered_df = filtered_df[filtered_df['issue_category'] == selected_category]
+
+    total_issues = len(filtered_df)
+    open_issues = len(filtered_df[filtered_df['is_resolved'] == 0])
+    critical_issues = len(filtered_df[(filtered_df['severity'] == 'Critical') & (filtered_df['is_resolved'] == 0)])
+    resolved_issues = len(filtered_df[filtered_df['is_resolved'] == 1])
+    
+    m_cols = st.columns(4)
+    m_cols[0].metric("Total Issues (in selection)", total_issues)
+    m_cols[1].metric("Open Issues", open_issues, delta=f"-{resolved_issues} resolved")
+    m_cols[2].metric("Critical Open", critical_issues)
+    m_cols[3].metric("Resolved Issues", resolved_issues)
     
     st.subheader(f"📋 Issues List ({len(filtered_df)} issues)")
 
-    st.markdown('<a href="#latest_issue">⬇️ Go to Latest Issue</a>', unsafe_allow_html=True)
-
     if not filtered_df.empty:
-        for scheme_name, scheme_issues in filtered_df.groupby('scheme_name'):
+        group_by_cols = ['district_name', 'scheme_name'] if role == 'Corporate' else ['scheme_name']
+        
+        for group_keys, scheme_issues in filtered_df.groupby(group_by_cols):
+            district_name_for_group = group_keys[0] if role == 'Corporate' else user_data['district_name']
+            scheme_name = group_keys[1] if role == 'Corporate' else group_keys
+            
             open_issue_count = len(scheme_issues[scheme_issues['is_resolved']==0])
-            expander_title = f"**{scheme_name}** - {open_issue_count} Open Issue(s)"
+            expander_title = f"**{district_name_for_group} | {scheme_name}** - {open_issue_count} Open Issue(s)"
+            
             with st.expander(expander_title):
-                
-                if open_issue_count > 0:
-                    if st.button("Send Scheme Summary Alert", key=f"notify_scheme_{scheme_name}"):
+                if open_issue_count > 0 and role == 'Engineer':
+                    if st.button("Send Scheme Summary Alert", key=f"notify_scheme_{scheme_name}_{district_name_for_group}"):
                         open_issues_df = scheme_issues[scheme_issues['is_resolved'] == 0]
                         summary_message = create_whatsapp_summary_message(scheme_name, open_issues_df)
                         st.session_state.message_to_send = summary_message
-                        st.session_state.message_key_prefix = f"summary_{scheme_name}"
+                        st.session_state.message_key_prefix = f"summary_{scheme_name}_{district_name_for_group}"
                 
-                if st.session_state.get('message_to_send') and st.session_state.get('message_key_prefix') == f"summary_{scheme_name}":
-                    show_whatsapp_sender(st.session_state.message_to_send, district_id, key_prefix=st.session_state.message_key_prefix)
+                if st.session_state.get('message_to_send') and st.session_state.get('message_key_prefix') == f"summary_{scheme_name}_{district_name_for_group}":
+                    show_whatsapp_sender(st.session_state.message_to_send, user_data['district_id'], key_prefix=st.session_state.message_key_prefix)
 
                 for idx, issue in scheme_issues.iterrows():
                     severity_emoji = {'Critical': '🚨', 'High': '⚠️', 'Medium': '🔔', 'Low': '📢'}
@@ -1185,9 +1221,6 @@ def show_issues_dashboard(user_data):
                         st.success("Issue resolved!")
                         st.rerun()
                     st.markdown("---")
-
-        st.markdown("<div id='latest_issue'></div>", unsafe_allow_html=True)
-    
     else:
         st.info("No issues match the current filters.")
 
@@ -1195,36 +1228,53 @@ def show_issues_dashboard(user_data):
     st.subheader("📥 Download Filtered Issues List")
     excel_data = create_issues_report_excel(filtered_df)
     if excel_data:
+        report_name = f"Multi-District_Issues_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx" if role == 'Corporate' else f"{user_data['district_name']}_Issues_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx"
         st.download_button(
             label="📥 Download Issues Report (Excel)",
             data=excel_data,
-            file_name=f"{district_name}_Issues_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx",
+            file_name=report_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 def show_verification(user_data):
-    """O&M Verification page for district with multi-block support"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
-    st.title(f"📝 {district_name} - O&M Verification Tracking")
-    
+    """O&M Verification page, now works for Corporate users with a district filter."""
+    role = user_data.get('role')
+
+    if role == 'Corporate':
+        st.title("📝 Corporate - O&M Verification Tracking")
+    else:
+        st.title(f"📝 {user_data['district_name']} - O&M Verification Tracking")
+        
     df = get_scheme_data_with_issues(user_data)
+    
+    if role == 'Corporate' and not df.empty:
+        districts = ["All Districts"] + sorted(df['district_name'].unique().tolist())
+        selected_district = st.selectbox("Filter by District", districts)
+        if selected_district != "All Districts":
+            df = df[df['district_name'] == selected_district].copy()
+    
     if not df.empty:
-        df_to_edit = df[['scheme_id', 'scheme_name', 'block', 'agency', 'agency_submitted_date', 'tpia_verified_date', 'ee_verified_date']].copy()
+        df_to_edit = df[['district_id', 'scheme_id', 'district_name', 'scheme_name', 'block', 'agency', 'agency_submitted_date', 'tpia_verified_date', 'ee_verified_date']].copy()
         
         for col in ['agency_submitted_date', 'tpia_verified_date', 'ee_verified_date']:
             df_to_edit[col] = pd.to_datetime(df_to_edit[col], errors='coerce')
         
+        column_config = {
+            "district_id": None, 
+            "scheme_id": st.column_config.TextColumn("Scheme ID", disabled=True),
+            "district_name": st.column_config.TextColumn("District", disabled=True),
+            "scheme_name": st.column_config.TextColumn("Scheme Name", disabled=True),
+            "agency_submitted_date": st.column_config.DateColumn("Agency Submitted", format="DD/MM/YYYY"),
+            "tpia_verified_date": st.column_config.DateColumn("TPIA Verified", format="DD/MM/YYYY"),
+            "ee_verified_date": st.column_config.DateColumn("EE Verified", format="DD/MM/YYYY")
+        }
+        if role != 'Corporate':
+            column_config['district_name'] = None
+
         edited_df = st.data_editor(
             df_to_edit, 
             key="verification_editor", 
-            column_config={
-                "scheme_id": st.column_config.TextColumn(disabled=True),
-                "scheme_name": st.column_config.TextColumn(disabled=True),
-                "agency_submitted_date": st.column_config.DateColumn("Agency Submitted", format="DD/MM/YYYY"),
-                "tpia_verified_date": st.column_config.DateColumn("TPIA Verified", format="DD/MM/YYYY"),
-                "ee_verified_date": st.column_config.DateColumn("EE Verified", format="DD/MM/YYYY")
-            }, 
+            column_config=column_config,
             use_container_width=True, 
             hide_index=True
         )
@@ -1240,7 +1290,7 @@ def show_verification(user_data):
                         UPDATE schemes 
                         SET agency_submitted_date=?, tpia_verified_date=?, ee_verified_date=? 
                         WHERE scheme_id=? AND district_id=?
-                    ''', (agency_date, tpia_date, ee_date, row['scheme_id'], district_id))
+                    ''', (agency_date, tpia_date, ee_date, row['scheme_id'], row['district_id']))
                 conn.commit()
             st.success("Verification dates saved!")
             st.rerun()
@@ -1248,17 +1298,25 @@ def show_verification(user_data):
         st.info("No schemes found to track verification.")
 
 def show_problem_schemes(user_data):
-    """Show schemes with progress vs timeline issues with WhatsApp functionality for Engineers and multi-block support"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
+    """Show problem schemes, now works for Corporate users with a district filter."""
     role = user_data.get('role')
-    st.title(f"🚨 {district_name} - Problem Schemes")
+    
+    if role == 'Corporate':
+        st.title(f"🚨 Corporate - Problem Schemes")
+    else:
+        st.title(f"🚨 {user_data['district_name']} - Problem Schemes")
     
     df = get_scheme_data_with_issues(user_data)
     if df.empty:
         st.info("No scheme data available.")
         return
     
+    if role == 'Corporate' and not df.empty:
+        districts = ["All Districts"] + sorted(df['district_name'].unique().tolist())
+        selected_district = st.selectbox("Filter by District", districts)
+        if selected_district != "All Districts":
+            df = df[df['district_name'] == selected_district].copy()
+            
     problem_schemes = df[
         ((df['avg_progress'] >= 80) & (df['adjusted_days_remaining'] > 60)) |
         ((df['avg_progress'] >= 60) & (df['adjusted_days_remaining'] > 90)) |
@@ -1272,11 +1330,9 @@ def show_problem_schemes(user_data):
         return
     
     st.info(f"Found {len(problem_schemes)} schemes that require attention.")
-    
-    st.markdown('<a href="#latest_problem">⬇️ Go to Last Scheme</a>', unsafe_allow_html=True)
 
     for index, scheme in problem_schemes.iterrows():
-        expander_title = f"**{scheme['scheme_name']}** (Block: {scheme['block']}) - {scheme['open_issues']} Open Issue(s)"
+        expander_title = f"**{scheme['district_name']} | {scheme['scheme_name']}** (Block: {scheme['block']}) - {scheme['open_issues']} Open Issue(s)"
         with st.expander(expander_title):
             with sqlite3.connect(DB_PATH) as conn:
                 issues_query = """
@@ -1287,16 +1343,16 @@ def show_problem_schemes(user_data):
                     WHERE i.scheme_id = ? AND i.district_id = ? AND i.is_resolved = 0
                     ORDER BY c.component_group, i.reported_date DESC
                 """
-                scheme_issues_df = pd.read_sql_query(issues_query, conn, params=(scheme['scheme_id'], district_id))
+                scheme_issues_df = pd.read_sql_query(issues_query, conn, params=(scheme['scheme_id'], scheme['district_id']))
 
             if not scheme_issues_df.empty:
-                if st.button("Send Scheme Summary Alert", key=f"notify_prob_scheme_{scheme['scheme_id']}"):
+                if role == 'Engineer' and st.button("Send Scheme Summary Alert", key=f"notify_prob_scheme_{scheme['scheme_id']}"):
                     summary_message = create_whatsapp_summary_message(scheme['scheme_name'], scheme_issues_df)
                     st.session_state.message_to_send = summary_message
                     st.session_state.message_key_prefix = f"summary_prob_{scheme['scheme_id']}"
 
                 if st.session_state.get('message_to_send') and st.session_state.get('message_key_prefix') == f"summary_prob_{scheme['scheme_id']}":
-                    show_whatsapp_sender(st.session_state.message_to_send, district_id, key_prefix=st.session_state.message_key_prefix)
+                    show_whatsapp_sender(st.session_state.message_to_send, user_data['district_id'], key_prefix=st.session_state.message_key_prefix)
                 
                 for component_group, issues in scheme_issues_df.groupby('component_group'):
                     st.markdown(f"#### Issues in: {component_group}")
@@ -1305,36 +1361,57 @@ def show_problem_schemes(user_data):
             else:
                 st.warning("This scheme is flagged as a problem, but no open issues were found. This might be due to a long timeline.")
 
-    st.markdown("<div id='latest_problem'></div>", unsafe_allow_html=True)
-
     st.markdown("---")
     st.subheader("📥 Download Detailed Problem Report")
     
     excel_data = create_problem_report_excel(problem_schemes)
     if excel_data:
+        report_name = f"Multi-District_Problem_Schemes_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx" if role == 'Corporate' else f"{user_data['district_name']}_Problem_Schemes_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx"
         st.download_button(
             label="📥 Download Problem Report (Excel)",
             data=excel_data,
-            file_name=f"{district_name}_Problem_Schemes_Report_{datetime.now(IST).strftime('%Y%m%d')}.xlsx",
+            file_name=report_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 def show_whatsapp_contacts(user_data):
-    """WhatsApp contacts management - Only for Managers and above"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
+    """WhatsApp contacts management, with district selection for Corporate users."""
     role = user_data.get('role')
     
-    # Check if user has permission
     if role == 'Engineer':
-        st.error("❌ Access Denied: Engineers cannot manage WhatsApp contacts. This feature is available only to Managers and above.")
-        st.info("💡 **Note:** You can still send WhatsApp alerts from the Issues Dashboard and Problem Schemes pages.")
+        st.error("❌ Access Denied: This feature is available only to Managers and above.")
+        st.info("💡 You can still send WhatsApp alerts from the Issues Dashboard and Problem Schemes pages.")
         return
-    
-    st.title(f"📱 {district_name} - WhatsApp Contacts")
-    
+
+    district_id = None
+    district_name = None
+
+    if role == 'Corporate':
+        st.title("📱 Corporate - WhatsApp Contacts")
+        with sqlite3.connect(DB_PATH) as conn:
+            districts_df = pd.read_sql_query("SELECT district_id, district_name FROM districts ORDER BY district_name", conn)
+        
+        if districts_df.empty:
+            st.warning("No districts found. Please add districts in the Admin Panel.")
+            return
+            
+        district_map = pd.Series(districts_df.district_id.values, index=districts_df.district_name).to_dict()
+        selected_district_name = st.selectbox("Select District to Manage Contacts for:", list(district_map.keys()))
+        
+        if selected_district_name:
+            district_id = district_map[selected_district_name]
+            district_name = selected_district_name
+    else:
+        district_id = user_data['district_id']
+        district_name = user_data['district_name']
+        st.title(f"📱 {district_name} - WhatsApp Contacts")
+
+    if not district_id:
+        st.info("Please select a district to proceed.")
+        return
+
     st.subheader("➕ Add New Contact")
-    with st.form("add_contact_form"):
+    with st.form(f"add_contact_form_{district_id}"):
         col1, col2 = st.columns(2)
         contact_name = col1.text_input("Contact Name")
         contact_role = col2.text_input("Role/Designation")
@@ -1346,7 +1423,7 @@ def show_whatsapp_contacts(user_data):
                     conn.execute('INSERT INTO whatsapp_contacts (district_id, contact_name, contact_role, phone_number) VALUES (?, ?, ?, ?)',
                                  (district_id, contact_name, contact_role, phone_number))
                     conn.commit()
-                st.success(f"✅ Contact {contact_name} added successfully!")
+                st.success(f"✅ Contact {contact_name} added successfully for {district_name}!")
                 st.rerun()
             else:
                 st.error("Please fill all fields.")
@@ -1355,7 +1432,7 @@ def show_whatsapp_contacts(user_data):
         contacts_df = pd.read_sql_query("SELECT * FROM whatsapp_contacts WHERE district_id = ? AND is_active = 1", conn, params=(district_id,))
     
     if not contacts_df.empty:
-        st.subheader("📋 Current Contacts")
+        st.subheader(f"📋 Current Contacts for {district_name}")
         for _, contact in contacts_df.iterrows():
             col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
             col1.write(f"**{contact['contact_name']}**")
@@ -1365,26 +1442,48 @@ def show_whatsapp_contacts(user_data):
             whatsapp_link = f"https://wa.me/{contact['phone_number']}?text={quote(test_message)}"
             col4.markdown(f"[📱 Test]({whatsapp_link})")
     else:
-        st.info("No contacts added yet. Add your first contact above.")
+        st.info(f"No contacts added yet for {district_name}. Add your first contact above.")
 
 def show_import_data(user_data):
-    """Import schemes data - Only for Managers and above"""
-    district_id = user_data['district_id']
-    district_name = user_data['district_name']
+    """Import schemes data, with district selection for Corporate users and robust position-based import."""
     role = user_data.get('role')
     
-    # Check if user has permission
     if role == 'Engineer':
-        st.error("❌ Access Denied: Engineers cannot import data. This feature is available only to Managers and above.")
-        st.info("💡 **Note:** Please contact your Manager/Coordinator to import scheme data.")
+        st.error("❌ Access Denied: This feature is available only to Managers and above.")
+        st.info("💡 Please contact your Manager/Coordinator to import scheme data.")
+        return
+
+    district_id = None
+    district_name = None
+
+    if role == 'Corporate':
+        st.title("📁 Corporate - Import Schemes")
+        with sqlite3.connect(DB_PATH) as conn:
+            districts_df = pd.read_sql_query("SELECT district_id, district_name FROM districts ORDER BY district_name", conn)
+        
+        if districts_df.empty:
+            st.warning("No districts found. Please add districts in the Admin Panel.")
+            return
+            
+        district_map = pd.Series(districts_df.district_id.values, index=districts_df.district_name).to_dict()
+        selected_district_name = st.selectbox("Select District to Import Schemes for:", list(district_map.keys()))
+        
+        if selected_district_name:
+            district_id = district_map[selected_district_name]
+            district_name = selected_district_name
+    else:
+        district_id = user_data['district_id']
+        district_name = user_data['district_name']
+        st.title(f"📁 {district_name} - Import Schemes")
+
+    if not district_id:
+        st.info("Please select a district to proceed.")
         return
     
-    st.title(f"📁 {district_name} - Import Schemes")
-    
-    st.subheader("Import JJM Schemes from Excel")
+    st.subheader(f"Import JJM Schemes for {district_name} from Excel")
     st.info("Upload your Excel file with scheme details. The system will auto-detect headers.")
     
-    uploaded_file = st.file_uploader("Choose an Excel file", type=['xlsx', 'xls'])
+    uploaded_file = st.file_uploader("Choose an Excel file", type=['xlsx', 'xls'], key=f"uploader_{district_id}")
     
     if uploaded_file:
         try:
@@ -1399,6 +1498,8 @@ def show_import_data(user_data):
             
             if header_row_index != -1:
                 df = pd.read_excel(uploaded_file, header=header_row_index)
+                
+                # --- FIX: Reverted to position-based renaming for reliability ---
                 cols = df.columns
                 df.rename(columns={cols[0]: 'sr_no', cols[1]: 'block', cols[2]: 'agency', cols[3]: 'scheme_name', cols[4]: 'scheme_id'}, inplace=True)
                 df = df.dropna(subset=['sr_no', 'block', 'agency', 'scheme_name', 'scheme_id'])
@@ -1406,9 +1507,10 @@ def show_import_data(user_data):
                 st.write("Preview of schemes to import:")
                 st.dataframe(df.head(10))
                 
-                if st.button("📥 Import Schemes", type="primary", use_container_width=True):
+                if st.button(f"📥 Import Schemes for {district_name}", type="primary", use_container_width=True):
                     with st.spinner("Importing..."):
                         with sqlite3.connect(DB_PATH) as conn:
+                            # This will delete existing schemes and progress FOR THIS DISTRICT ONLY
                             conn.execute("DELETE FROM schemes WHERE district_id = ?", (district_id,))
                             conn.execute("DELETE FROM progress WHERE district_id = ?", (district_id,))
                             
@@ -1416,17 +1518,23 @@ def show_import_data(user_data):
                                 has_tw2 = 'TW-2' in str(row['scheme_name']).upper()
                                 clean_name = str(row['scheme_name']).replace(' TW-2', '').replace(' tw-2', '')
                                 
+                                # Data cleaning on import
+                                scheme_id = str(row['scheme_id']).strip()
+                                block = str(row['block']).strip()
+                                agency = str(row['agency']).strip()
+                                
                                 conn.execute('INSERT OR REPLACE INTO schemes (scheme_id, district_id, sr_no, block, agency, scheme_name, has_tw2) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                                             (str(row['scheme_id']).strip(), district_id, int(row['sr_no']), row['block'].strip(), row['agency'].strip(), clean_name, has_tw2))
+                                             (scheme_id, district_id, int(row['sr_no']), block, agency, clean_name, has_tw2))
                             conn.commit()
                     
-                    st.success(f"🎉 Successfully imported {len(df)} schemes!")
+                    st.success(f"🎉 Successfully imported {len(df)} schemes for {district_name}!")
                     st.rerun()
             else:
-                st.error("Could not find header row with Block, Agency, and Scheme columns.")
+                st.error("Could not find a valid header row. Ensure columns for 'Block', 'Agency', and 'Scheme' exist in the first 10 rows.")
         
         except Exception as e:
             st.error(f"❌ Import failed: {e}")
+            st.info("Please ensure your file has at least 5 columns in the correct order: Sr No, Block, Agency, Scheme Name, Scheme ID.")
 
 def show_admin_panel():
     """Admin panel for managing districts and users with enhanced multi-block agency support"""
@@ -1481,20 +1589,17 @@ def show_admin_panel():
                 ORDER BY d.district_name, u.role, u.full_name
             """, conn)
         
-        # Enhanced display with assignment details and scheme counts
         if not all_users.empty:
             display_df = all_users.copy()
             display_df['assignment_display'] = display_df.apply(lambda row: format_assignment_display(row['assigned_block'], row['assigned_agency']), axis=1)
             display_df['assigned_agency'] = display_df['assigned_agency'].fillna('❌ NOT SET')
             
-            # Show the user management table
             cols_to_show = ['full_name', 'username', 'role', 'district_name', 'assignment_display', 'is_active']
             display_df_renamed = display_df[cols_to_show].copy()
             display_df_renamed.columns = ['Full Name', 'Username', 'Role', 'District', 'Assignment', 'Active']
             st.dataframe(display_df_renamed, use_container_width=True)
             
-            # Show warning for Engineers without agency assignment
-            engineers_without_agency = all_users[(all_users['role'] == 'Engineer') & (all_users['assigned_agency'].isna())]
+            engineers_without_agency = all_users[(all_users['role'] == 'Engineer') & (all_users['assigned_agency'] == '❌ NOT SET')]
             if not engineers_without_agency.empty:
                 st.warning(f"⚠️ {len(engineers_without_agency)} Engineer(s) don't have agency assignment and cannot login!")
 
@@ -1507,9 +1612,7 @@ def show_admin_panel():
                 if not districts_df.empty:
                     district_map = pd.Series(districts_df.district_id.values, index=districts_df.district_name).to_dict()
                     
-                    # --- Form for data entry and submission ---
                     with st.form("add_user_form", clear_on_submit=True):
-                        # ALL WIDGETS ARE NOW INSIDE THE FORM
                         selected_district_name = st.selectbox("Assign to District", options=districts_df['district_name'].tolist())
                         role = st.selectbox("Role", ["Engineer", "Manager / Coordinator", "Corporate"])
                         
@@ -1524,7 +1627,7 @@ def show_admin_panel():
                         if role == "Engineer":
                             selected_district_id = district_map[selected_district_name]
                             
-                            st.markdown("#### Block Assignment Details")
+                            st.markdown("#### Block & Agency Assignment")
                             available_blocks = get_available_blocks_for_district(selected_district_id)
                             if available_blocks:
                                 selected_blocks = st.multiselect("Select Blocks (one or more):", available_blocks)
@@ -1533,15 +1636,22 @@ def show_admin_panel():
                                 st.info("This Engineer will be assigned to ALL blocks (No specific blocks found).")
                                 assigned_block = "ALL"
 
-                            st.markdown("#### Agency Assignment")
                             available_agencies = get_available_agencies_for_district(selected_district_id)
                             if available_agencies:
                                 assigned_agency = st.selectbox("Select Agency (Required for Engineers):", [""] + available_agencies)
                             else:
                                 st.warning("No agencies available. Engineer cannot be assigned until data is imported.")
                                 assigned_agency = ""
-                        else:
-                            st.info(f"The '{role}' will be assigned to ALL blocks and agencies in this district.")
+                        elif role == "Manager / Coordinator":
+                            selected_district_id = district_map[selected_district_name]
+                            st.markdown("#### Block Assignment (Optional)")
+                            available_blocks = get_available_blocks_for_district(selected_district_id)
+                            if available_blocks:
+                                selected_blocks = st.multiselect("Select Blocks (leave empty for ALL):", available_blocks)
+                                assigned_block = ','.join(selected_blocks) if selected_blocks else "ALL"
+                            assigned_agency = "ALL"
+                        else: # Corporate
+                            st.info(f"The '{role}' will have access to ALL districts, blocks, and agencies.")
                         
                         submitted = st.form_submit_button("Create User")
 
@@ -1582,79 +1692,50 @@ def show_admin_panel():
                         user_list = all_users.set_index('user_id')[['username', 'full_name', 'role']].apply(lambda x: f"{x['username']} ({x['full_name']}) - {x['role']}", axis=1).to_dict()
                         selected_user_id = st.selectbox("Select User to Edit", options=list(user_list.keys()), format_func=lambda x: user_list[x])
                         
-                        # Get current user data
                         current_user = all_users[all_users['user_id'] == selected_user_id].iloc[0]
                         
                         new_password = st.text_input("New Password (leave blank to keep current)", type="password")
                         is_active = st.checkbox("Is Active?", value=bool(current_user['is_active']))
                         
-                        # Get district info for the user
                         with sqlite3.connect(DB_PATH) as conn:
-                            user_district = pd.read_sql_query("SELECT district_id FROM district_users WHERE user_id = ?", conn, params=(selected_user_id,)).iloc[0]['district_id']
+                            user_district_id = pd.read_sql_query("SELECT district_id FROM district_users WHERE user_id = ?", conn, params=(int(selected_user_id),)).iloc[0]['district_id']
                         
-                        # Enhanced Block Assignment Editing
-                        st.markdown("#### Update Block Assignment")
-                        available_blocks = get_available_blocks_for_district(user_district)
-                        current_blocks = parse_assigned_blocks(current_user['assigned_block'])
-                        
-                        if available_blocks:
-                            if current_user['assigned_block'] and current_user['assigned_block'].upper() == "ALL":
-                                edit_assignment_type = st.radio("Block Assignment Type:", ["All Blocks", "Specific Blocks"], index=0, horizontal=True, key="edit_blocks")
-                            else:
-                                edit_assignment_type = st.radio("Block Assignment Type:", ["All Blocks", "Specific Blocks"], index=1, horizontal=True, key="edit_blocks")
+                        st.markdown("#### Update Assignment")
+                        if current_user['role'] != 'Corporate':
+                            available_blocks = get_available_blocks_for_district(user_district_id)
+                            current_blocks = parse_assigned_blocks(current_user['assigned_block'])
                             
-                            if edit_assignment_type == "All Blocks":
-                                new_assigned_block = "ALL"
-                            else:
+                            if available_blocks:
                                 new_selected_blocks = st.multiselect("Update Block Assignment:", available_blocks, default=current_blocks, key="edit_blocks_multi")
-                                new_assigned_block = ','.join(new_selected_blocks) if new_selected_blocks else current_user['assigned_block']
-                        else:
-                            new_assigned_block = current_user['assigned_block']
-                        
-                        # Enhanced Agency Assignment Editing
-                        st.markdown("#### Update Agency Assignment")
-                        available_agencies = get_available_agencies_for_district(user_district)
-                        if current_user['role'] == 'Engineer':
-                            if available_agencies:
+                                new_assigned_block = ','.join(new_selected_blocks) if new_selected_blocks else "ALL"
+                            else:
+                                new_assigned_block = current_user['assigned_block']
+
+                            available_agencies = get_available_agencies_for_district(user_district_id)
+                            if current_user['role'] == 'Engineer':
                                 current_agency_index = available_agencies.index(current_user['assigned_agency']) if current_user['assigned_agency'] in available_agencies else 0
-                                new_agency = st.selectbox("Update Agency Assignment", available_agencies, index=current_agency_index, key="edit_agency")
-                            else:
-                                new_agency = st.text_input("Update Agency Assignment", value=current_user['assigned_agency'] or "", placeholder="e.g., SCL, Hetvi")
-                            st.info("⚠️ Engineers MUST have a specific agency assigned")
+                                new_agency = st.selectbox("Update Agency Assignment (Required)", available_agencies, index=current_agency_index, key="edit_agency")
+                            else: # Manager
+                                new_agency = "ALL"
                         else:
-                            if available_agencies:
-                                agency_options = ["ALL"] + available_agencies
-                                current_agency = current_user['assigned_agency'] or "ALL"
-                                current_agency_index = agency_options.index(current_agency) if current_agency in agency_options else 0
-                                new_agency = st.selectbox("Update Agency Assignment", agency_options, index=current_agency_index, key="edit_agency")
-                            else:
-                                new_agency = st.text_input("Update Agency Assignment (optional)", value=current_user['assigned_agency'] or "", placeholder="e.g., SCL, Hetvi, or ALL")
-                        
-                        # Real-time scheme count preview for edits
-                        if new_assigned_block and new_agency and available_blocks and available_agencies:
-                            preview_blocks = parse_assigned_blocks(new_assigned_block) if new_assigned_block != "ALL" else []
-                            scheme_count = get_scheme_count_for_assignment(user_district, new_agency, preview_blocks)
-                            if scheme_count > 0:
-                                st.success(f"📊 **Preview:** Updated assignment will give access to **{scheme_count} schemes**")
-                            else:
-                                st.warning(f"⚠️ **Preview:** No schemes found for this assignment combination")
+                            st.info("Corporate users have access to all districts and agencies. No specific assignment needed.")
+                            new_assigned_block = "ALL"
+                            new_agency = "ALL"
                         
                         if st.form_submit_button("Update User"):
-                            # Validate Engineer agency assignment
                             if current_user['role'] == 'Engineer' and (not new_agency or new_agency.upper() == "ALL"):
-                                st.error("❌ Engineers must be assigned to a specific agency (cannot be 'ALL' or empty)")
-                                return
-                            
-                            with sqlite3.connect(DB_PATH) as conn:
-                                if new_password:
-                                    conn.execute("UPDATE district_users SET password_hash = ?, is_active = ?, assigned_block = ?, assigned_agency = ? WHERE user_id = ?", 
-                                               (hash_password(new_password), is_active, new_assigned_block.upper(), new_agency, selected_user_id))
-                                else:
-                                    conn.execute("UPDATE district_users SET is_active = ?, assigned_block = ?, assigned_agency = ? WHERE user_id = ?", 
-                                               (is_active, new_assigned_block.upper(), new_agency, selected_user_id))
-                                conn.commit()
-                            st.success("User updated!")
-                            st.rerun()
+                                st.error("❌ Engineers must be assigned to a specific agency.")
+                            else:
+                                with sqlite3.connect(DB_PATH) as conn:
+                                    if new_password:
+                                        conn.execute("UPDATE district_users SET password_hash = ?, is_active = ?, assigned_block = ?, assigned_agency = ? WHERE user_id = ?", 
+                                                   (hash_password(new_password), is_active, new_assigned_block.upper(), new_agency, selected_user_id))
+                                    else:
+                                        conn.execute("UPDATE district_users SET is_active = ?, assigned_block = ?, assigned_agency = ? WHERE user_id = ?", 
+                                                   (is_active, new_assigned_block.upper(), new_agency, selected_user_id))
+                                    conn.commit()
+                                st.success("User updated!")
+                                st.rerun()
                 else:
                     st.info("No users have been created yet.")
 
@@ -1664,48 +1745,23 @@ def show_admin_panel():
             total_districts = pd.read_sql_query("SELECT COUNT(*) as count FROM districts", conn).iloc[0]['count']
             total_schemes = pd.read_sql_query("SELECT COUNT(*) as count FROM schemes", conn).iloc[0]['count']
             total_users = pd.read_sql_query("SELECT COUNT(*) as count FROM district_users", conn).iloc[0]['count']
-            engineers_without_agency = pd.read_sql_query("SELECT COUNT(*) as count FROM district_users WHERE role = 'Engineer' AND (assigned_agency IS NULL OR assigned_agency = '')", conn).iloc[0]['count']
+            engineers_without_agency = pd.read_sql_query("SELECT COUNT(*) as count FROM district_users WHERE role = 'Engineer' AND (assigned_agency IS NULL OR assigned_agency = '' OR assigned_agency = 'ALL')", conn).iloc[0]['count']
             
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Total Districts", total_districts)
             col2.metric("Total Schemes", total_schemes)
             col3.metric("Total Users", total_users)
-            col4.metric("Engineers Missing Agency", engineers_without_agency, delta="❌" if engineers_without_agency > 0 else "✅")
+            col4.metric("Engineers w/o Agency", engineers_without_agency, delta="Action Required" if engineers_without_agency > 0 else "OK")
             
             if total_schemes > 0:
                 district_stats = pd.read_sql_query("SELECT d.district_name, COUNT(s.scheme_id) as scheme_count FROM districts d LEFT JOIN schemes s ON d.district_id = s.district_id GROUP BY d.district_id, d.district_name ORDER BY scheme_count DESC", conn)
                 st.subheader("District-wise Scheme Distribution")
                 st.bar_chart(district_stats.set_index('district_name')['scheme_count'])
             
-            # User role distribution
             if total_users > 0:
                 user_role_stats = pd.read_sql_query("SELECT role, COUNT(*) as user_count FROM district_users GROUP BY role ORDER BY user_count DESC", conn)
                 st.subheader("User Role Distribution")
                 st.bar_chart(user_role_stats.set_index('role')['user_count'])
-            
-            # Assignment analysis for Engineers
-            if total_users > 0:
-                st.subheader("Engineer Assignment Analysis")
-                engineer_stats = pd.read_sql_query("""
-                    SELECT 
-                        d.district_name,
-                        u.assigned_agency,
-                        u.assigned_block,
-                        COUNT(*) as engineer_count
-                    FROM district_users u 
-                    JOIN districts d ON u.district_id = d.district_id 
-                    WHERE u.role = 'Engineer' AND u.assigned_agency IS NOT NULL
-                    GROUP BY d.district_name, u.assigned_agency, u.assigned_block
-                    ORDER BY d.district_name, u.assigned_agency
-                """, conn)
-                
-                if not engineer_stats.empty:
-                    for district in engineer_stats['district_name'].unique():
-                        district_engineers = engineer_stats[engineer_stats['district_name'] == district]
-                        st.markdown(f"**{district}:**")
-                        for _, eng in district_engineers.iterrows():
-                            blocks_display = eng['assigned_block'] if eng['assigned_block'] != 'ALL' else 'All Blocks'
-                            st.markdown(f"- {eng['assigned_agency']} | {blocks_display} | {eng['engineer_count']} engineer(s)")
     
     with tab4:
         st.subheader("⚙️ Forecast Settings")
@@ -1714,19 +1770,19 @@ def show_admin_panel():
         
         with st.form("delay_settings_form"):
             st.markdown("##### Severity-Based Delays")
-            delay_settings['high_issues'] = st.number_input("Delay for 'High' Severity Issues (days)", min_value=0, value=delay_settings['high_issues'])
-            delay_settings['critical_issues'] = st.number_input("Delay for 'Critical' Severity Issues (days)", min_value=0, value=delay_settings['critical_issues'])
+            delay_settings['high_issues'] = st.number_input("Delay for 'High' Severity Issues (days)", min_value=0, value=delay_settings.get('high_issues', 7))
+            delay_settings['critical_issues'] = st.number_input("Delay for 'Critical' Severity Issues (days)", min_value=0, value=delay_settings.get('critical_issues', 14))
             
             st.markdown("---")
             st.markdown("##### Category-Based Delays")
-            delay_settings['material_issues'] = st.number_input("Delay for 'Material not delivered' Issues (days)", min_value=0, value=delay_settings['material_issues'])
-            delay_settings['contractor_issues'] = st.number_input("Delay for 'Contractor not working' Issues (days)", min_value=0, value=delay_settings['contractor_issues'])
-            delay_settings['payment_issues'] = st.number_input("Delay for 'Payment issues' (days)", min_value=0, value=delay_settings['payment_issues'])
+            delay_settings['material_issues'] = st.number_input("Delay for 'Material not delivered' Issues (days)", min_value=0, value=delay_settings.get('material_issues', 10))
+            delay_settings['contractor_issues'] = st.number_input("Delay for 'Contractor not working' Issues (days)", min_value=0, value=delay_settings.get('contractor_issues', 14))
+            delay_settings['payment_issues'] = st.number_input("Delay for 'Payment issues' (days)", min_value=0, value=delay_settings.get('payment_issues', 21))
 
             if st.form_submit_button("💾 Save Delay Settings", type="primary"):
                 with sqlite3.connect(DB_PATH) as conn:
                     for name, days in delay_settings.items():
-                        conn.execute("UPDATE delay_settings SET delay_days = ? WHERE setting_name = ?", (days, name))
+                        conn.execute("INSERT OR REPLACE INTO delay_settings (setting_name, delay_days) VALUES (?, ?)", (name, days))
                     conn.commit()
                 st.success("✅ Delay settings have been updated!")
                 st.rerun()
@@ -1754,92 +1810,80 @@ def show_admin_panel():
                         st.success("✅ Admin password changed successfully!")
                         st.info("Please logout and login again with your new password.")
                     else:
-                        st.error("❌ New passwords don't match or too short (min 6 characters)!")
+                        st.error("❌ New passwords don't match or are too short (min 6 characters)!")
                 else:
                     st.error("❌ Current password is incorrect!")
 
 def show_district_app():
-    """Main district application with role-based navigation and enhanced assignment display"""
+    """Main application with role-based navigation and enhanced display."""
     user_data = st.session_state.user_data
     role = user_data.get('role')
     
-    st.sidebar.title(f"🚰 {user_data['district_name']}")
-    st.sidebar.markdown(f"**User:** {user_data['full_name']}")
-    st.sidebar.markdown(f"**Role:** {role}")
-    
-    # Enhanced assignment display in sidebar
-    if role == 'Engineer':
-        assigned_blocks = parse_assigned_blocks(user_data.get('assigned_block'))
-        assigned_agency = user_data.get('assigned_agency', 'N/A')
-        
-        if assigned_blocks:
-            if len(assigned_blocks) <= 2:
-                block_display = ', '.join(assigned_blocks)
-            else:
-                block_display = f"{', '.join(assigned_blocks[:2])}... (+{len(assigned_blocks)-2} more)"
-        else:
-            block_display = user_data.get('assigned_block', 'N/A')
-        
-        # Get scheme count for sidebar display
-        scheme_count = get_scheme_count_for_assignment(
-            user_data['district_id'], 
-            assigned_agency, 
-            assigned_blocks
-        )
-        
-        st.sidebar.markdown(f"**Agency:** {assigned_agency}")
-        st.sidebar.markdown(f"**Blocks:** {block_display}")
-        st.sidebar.markdown(f"**Schemes:** {scheme_count}")
+    if role == 'Corporate':
+        st.sidebar.title("🚰 JJM O&M Tracker")
+        st.sidebar.markdown(f"**User:** {user_data['full_name']}")
+        st.sidebar.markdown(f"**Role:** {role}")
+        st.sidebar.markdown(f"**Access:** All Districts")
     else:
-        st.sidebar.markdown(f"**Block:** {user_data.get('assigned_block', 'N/A')}")
+        st.sidebar.title(f"🚰 {user_data['district_name']}")
+        st.sidebar.markdown(f"**User:** {user_data['full_name']}")
+        st.sidebar.markdown(f"**Role:** {role}")
+        
+        if role == 'Engineer':
+            assigned_blocks = parse_assigned_blocks(user_data.get('assigned_block'))
+            assigned_agency = user_data.get('assigned_agency', 'N/A')
+            
+            block_display = ', '.join(assigned_blocks) if len(assigned_blocks) <= 2 else f"{', '.join(assigned_blocks[:2])}..."
+            if not assigned_blocks:
+                block_display = "All Blocks"
+            
+            scheme_count = get_scheme_count_for_assignment(user_data['district_id'], assigned_agency, assigned_blocks)
+            
+            st.sidebar.markdown(f"**Agency:** {assigned_agency}")
+            st.sidebar.markdown(f"**Blocks:** {block_display}")
+            st.sidebar.markdown(f"**Schemes:** {scheme_count}")
+        else: 
+            st.sidebar.markdown(f"**Block:** {user_data.get('assigned_block', 'N/A')}")
 
     if st.sidebar.button("🚪 Logout"):
-        for key in ['authenticated', 'user_type', 'user_data', 'message_to_send', 'message_key_prefix']:
-            if key in st.session_state:
-                del st.session_state[key]
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
         st.rerun()
     
-    # Role-based navigation menu
     base_pages = ["Dashboard", "Progress Entry", "Issues Dashboard", "Analytics", "O&M Verification", "Problem Schemes"]
     
-    # Add restricted pages based on role
     if role in ['Manager / Coordinator', 'Corporate']:
         base_pages.extend(["WhatsApp Contacts", "Import Data"])
     
     page = st.sidebar.selectbox("Navigate to:", base_pages)
     
-    # Show role restrictions info for Engineers
     if role == 'Engineer':
         with st.sidebar.expander("ℹ️ Role Restrictions"):
             st.info("""
             **Engineer Access:**
-            ✅ All analysis and progress entry
-            ✅ WhatsApp alerts in Issues & Problem pages
-            ❌ WhatsApp contacts management
-            ❌ Data import (contact your manager)
+            - View assigned schemes & progress.
+            - Enter progress & report issues.
+            - Send WhatsApp alerts.
+            - Cannot import data or manage contacts.
             """)
     
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Version 1.3.3 with Import Fix**")
+    st.sidebar.markdown("**Version 1.4.1**")
     st.sidebar.markdown("**Published by V R Patruni**")
     
-    # Route to appropriate page
-    if page == "Dashboard":
-        show_dashboard(user_data)
-    elif page == "Progress Entry":
-        show_progress_entry(user_data)
-    elif page == "Issues Dashboard":
-        show_issues_dashboard(user_data)
-    elif page == "Analytics":
-        show_analytics(user_data)
-    elif page == "O&M Verification":
-        show_verification(user_data)
-    elif page == "Problem Schemes":
-        show_problem_schemes(user_data)
-    elif page == "WhatsApp Contacts":
-        show_whatsapp_contacts(user_data)
-    elif page == "Import Data":
-        show_import_data(user_data)
+    page_functions = {
+        "Dashboard": show_dashboard,
+        "Progress Entry": show_progress_entry,
+        "Issues Dashboard": show_issues_dashboard,
+        "Analytics": show_analytics,
+        "O&M Verification": show_verification,
+        "Problem Schemes": show_problem_schemes,
+        "WhatsApp Contacts": show_whatsapp_contacts,
+        "Import Data": show_import_data
+    }
+    
+    if page in page_functions:
+        page_functions[page](user_data)
 
 def main():
     """Main application entry point"""
